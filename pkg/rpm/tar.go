@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -14,6 +15,13 @@ import (
 	"github.com/sassoftware/go-rpmutils/cpio"
 	log "github.com/sirupsen/logrus"
 )
+
+var usrMergeAliases = map[string]string{
+	"/bin":   "/usr/bin",
+	"/lib":   "/usr/lib",
+	"/lib64": "/usr/lib64",
+	"/sbin":  "/usr/sbin",
+}
 
 type Collector struct {
 	createdPaths map[string]struct{}
@@ -49,8 +57,41 @@ func RPMToCPIO(rpmReader io.Reader) (*cpio.CpioStream, error) {
 	return cpio.NewCpioStream(payloadReader), nil
 }
 
+func normalizeTarPath(name string) string {
+	name = strings.TrimPrefix(name, "./")
+	name = strings.TrimPrefix(name, "/")
+	return path.Clean("/" + name)
+}
+
+func detectUsrMergeAlias(name, linkname string) (string, bool) {
+	expectedTarget, exists := usrMergeAliases[name]
+	if !exists {
+		return "", false
+	}
+
+	return expectedTarget, normalizeTarPath(linkname) == expectedTarget
+}
+
+func normalizeUsrMergePath(prefix, name string, aliases map[string]string) string {
+	for alias, target := range aliases {
+		if prefix != target && !strings.HasPrefix(prefix, target+"/") {
+			continue
+		}
+
+		if name == alias {
+			return target
+		}
+
+		if strings.HasPrefix(name, alias+"/") {
+			return target + strings.TrimPrefix(name, alias)
+		}
+	}
+
+	return name
+}
+
 func PrefixFilter(prefix, strip string, reader *tar.Reader, files []string) error {
-	prefix = strings.TrimPrefix(prefix, ".")
+	prefix = normalizeTarPath(prefix)
 
 	fileMap := map[string]string{}
 	for _, file := range files {
@@ -67,11 +108,13 @@ func PrefixFilter(prefix, strip string, reader *tar.Reader, files []string) erro
 		if !strings.HasPrefix(key, "/") {
 			key = "/" + key
 		}
+		key = path.Clean(key)
 
 		log.Tracef("Mapped file %v -> %v", key, file)
 		fileMap[key] = file
 	}
 
+	aliases := map[string]string{}
 	for {
 		entry, err := reader.Next()
 		if err == io.EOF {
@@ -80,10 +123,12 @@ func PrefixFilter(prefix, strip string, reader *tar.Reader, files []string) erro
 		if len(fileMap) == 0 {
 			break
 		}
-		name := strings.TrimPrefix(entry.Name, ".")
-		if strings.HasPrefix(name, prefix) {
-		} else if prefix == "/usr/lib64" && strings.HasPrefix(name, "/lib64") {
-		} else {
+		name := normalizeTarPath(entry.Name)
+		if target, ok := detectUsrMergeAlias(name, entry.Linkname); ok && entry.Typeflag == tar.TypeSymlink {
+			aliases[name] = target
+		}
+		name = normalizeUsrMergePath(prefix, name, aliases)
+		if !strings.HasPrefix(name, prefix) {
 			continue
 		}
 

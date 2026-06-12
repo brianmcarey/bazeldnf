@@ -2,6 +2,7 @@ package rpm
 
 import (
 	"archive/tar"
+	"bytes"
 	"io"
 	"io/ioutil"
 	"os"
@@ -245,6 +246,82 @@ func TestTar2Files(t *testing.T) {
 			g.Expect(discoveredHeaders).To(ConsistOf(tt.expected))
 		})
 	}
+}
+
+func TestTar2FilesHandlesUsrMergePaths(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	var archive bytes.Buffer
+	tarWriter := tar.NewWriter(&archive)
+	writeEntry := func(header *tar.Header, content string) {
+		g.Expect(tarWriter.WriteHeader(header)).To(Succeed())
+		if header.Typeflag == tar.TypeReg {
+			_, err := tarWriter.Write([]byte(content))
+			g.Expect(err).ToNot(HaveOccurred())
+		}
+	}
+
+	writeEntry(&tar.Header{Name: "./usr", Typeflag: tar.TypeDir, Mode: 0755}, "")
+	writeEntry(&tar.Header{Name: "./usr/lib64", Typeflag: tar.TypeDir, Mode: 0755}, "")
+	writeEntry(&tar.Header{Name: "./lib64", Typeflag: tar.TypeSymlink, Linkname: "usr/lib64", Mode: 0777}, "")
+	writeEntry(&tar.Header{Name: "./lib64/libexample.so.1.0", Typeflag: tar.TypeReg, Mode: 0644, Size: 6}, "binary")
+	writeEntry(&tar.Header{Name: "./lib64/libexample.so.1", Typeflag: tar.TypeSymlink, Linkname: "libexample.so.1.0", Mode: 0777}, "")
+	g.Expect(tarWriter.Close()).To(Succeed())
+
+	tmpdir, err := ioutil.TempDir("", "usrmerge")
+	g.Expect(err).ToNot(HaveOccurred())
+	defer os.RemoveAll(tmpdir)
+
+	files := []string{}
+	for _, file := range []string{"/usr/lib64/libexample.so.1.0", "/usr/lib64/libexample.so.1"} {
+		err = os.MkdirAll(filepath.Join(tmpdir, filepath.Dir(file)), 0777)
+		g.Expect(err).ToNot(HaveOccurred())
+		files = append(files, filepath.Join(tmpdir, file))
+	}
+
+	err = PrefixFilter("./usr/lib64", tmpdir, tar.NewReader(bytes.NewReader(archive.Bytes())), files)
+	g.Expect(err).ToNot(HaveOccurred())
+
+	discoveredHeaders, err := collectFileInfo(tmpdir)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(discoveredHeaders).To(ConsistOf([]fileInfo{
+		{Name: "usr", Children: []fileInfo{
+			{Name: "lib64", Children: []fileInfo{
+				{Name: "libexample.so.1", Size: 17, Link: "libexample.so.1.0"},
+				{Name: "libexample.so.1.0", Size: 6},
+			}},
+		}},
+	}))
+}
+
+func TestTar2FilesDoesNotAliasWithoutUsrMergeSymlink(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	var archive bytes.Buffer
+	tarWriter := tar.NewWriter(&archive)
+	g.Expect(tarWriter.WriteHeader(&tar.Header{
+		Name:     "./lib64/libexample.so.1.0",
+		Typeflag: tar.TypeReg,
+		Mode:     0644,
+		Size:     6,
+	})).To(Succeed())
+	_, err := tarWriter.Write([]byte("binary"))
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(tarWriter.Close()).To(Succeed())
+
+	tmpdir, err := ioutil.TempDir("", "usrmerge-negative")
+	g.Expect(err).ToNot(HaveOccurred())
+	defer os.RemoveAll(tmpdir)
+
+	file := "/usr/lib64/libexample.so.1.0"
+	err = os.MkdirAll(filepath.Join(tmpdir, filepath.Dir(file)), 0777)
+	g.Expect(err).ToNot(HaveOccurred())
+
+	err = PrefixFilter("./usr/lib64", tmpdir, tar.NewReader(bytes.NewReader(archive.Bytes())), []string{
+		filepath.Join(tmpdir, file),
+	})
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("could not be found"))
 }
 
 func collectFileInfo(dirName string) ([]fileInfo, error) {
